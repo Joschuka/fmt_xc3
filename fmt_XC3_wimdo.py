@@ -90,9 +90,14 @@ def sample(coeffs, t):
     return a * (t*t*t) + b *(t*t) + c*t + d
 
 def processAnims(bs, jointList, animName):
-
     keyFramedBoneList = []
-
+    bs.seek(0x50)
+    version = bs.readUByte()
+    
+    if version != 3:
+        print("Couldn't load anim " + animName, ", unsupported version : " + str(version))
+        return None
+    
     bs.seek(0x53)
     bIsAdditive = bs.readByte()
     bs.seek(0x5C)
@@ -259,7 +264,7 @@ def processAnims(bs, jointList, animName):
         keyFramedBoneList.append(actionBone)       
     anim = NoeKeyFramedAnim(animName, jointList, keyFramedBoneList, 30)
 
-    return [anim] 
+    return anim
 
 def LoadAnms(jointList, animationList, motPaths):  
     for path in motPaths:
@@ -280,11 +285,15 @@ def LoadAnms(jointList, animationList, motPaths):
                 bs2.seek(next)
             for offs, size, name in zip(offsets, sizes, names):
                 if name.endswith(".anm"):
-                    animationList.append(processAnims(NoeBitStream(motData[offs:offs+size]), jointList, name)[0])
+                    an = processAnims(NoeBitStream(motData[offs:offs+size]), jointList, name)
+                    if an is not None:
+                        animationList.append(an)
         else:
             bs2 = NoeBitStream(motData)
             lName = rapi.getLocalFileName(path)
-            animationList.append(processAnims(bs2, jointList, lName)[0])      
+            an = processAnims(bs2, jointList, lName)[0]
+            if an is not None:
+                animationList.append(an)      
                 
 def LoadSkel(bs):
     jointList = []
