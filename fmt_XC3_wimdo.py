@@ -1,13 +1,17 @@
 from inc_noesis import *
 import os
 
+global bLoadSeveralWimdos
 bLoadSeveralWimdos = True
+global bLoadAnims
 bLoadAnims = True
 
 def registerNoesisTypes():
     handle = noesis.register("XC3 import", ".wimdo")
     noesis.setHandlerTypeCheck(handle, CheckType)
     noesis.setHandlerLoadModel(handle, LoadModel)
+    noesis.addOption(handle, "-wimdoList", "Wimdo list", noesis.OPTFLAG_WANTARG)
+    noesis.addOption(handle, "-wimdoAnm", "Wimdo anim", noesis.OPTFLAG_WANTARG)
     return 1
 
 def CheckType(data):
@@ -89,15 +93,98 @@ def sample(coeffs, t):
     a,b,c,d = coeffs
     return a * (t*t*t) + b *(t*t) + c*t + d
 
-def processAnims(bs, jointList, animName):
+def processV1Anim(bs, jointList, animName):
     keyFramedBoneList = []
-    bs.seek(0x50)
-    version = bs.readUByte()
+    bs.seek(0x53)
+    bIsAdditive = bs.readByte()
+    bs.seek(0x5C)
+    animLength = bs.readUInt()
+    bs.seek(0x78)
+    offs, entryCount, _ = bs.readUInt64(), bs.readUInt(), bs.readUInt()
+    fpsInv = 0.03333334  
     
-    if version != 3:
-        print("Couldn't load anim " + animName, ", unsupported version : " + str(version))
-        return None
+    bs.seek(offs)
+    infos = []
+    for i in range(entryCount):
+        infos.append([[bs.readUInt64(), bs.readUInt(), bs.readUInt()] for j in range(3)])   
     
+    bs.seek(0x28)
+    animDataOffs = bs.readUInt()
+    
+    #jInfo
+    bs.seek(animDataOffs + 0x20)    
+    jIDOffs = bs.readUInt64()
+    jCount = bs.readUInt()
+    # assert jCount == entryCount see pc000101.mot
+    
+    #joint indices
+    bs.seek(jIDOffs)
+    jIDToInfo = []
+    for i in range(jCount):
+        jIDToInfo.append(bs.readShort())
+    
+    for jID, infoID in enumerate(jIDToInfo):
+        if infoID == -1:
+            continue
+        info = infos[infoID]
+        actionBone = NoeKeyFramedBone(jID)
+        posNoeKeyFramedValues = []
+        rotNoeKeyFramedValues = []		
+        scaleNoeKeyFramedValues = []
+        for i, semInfo in enumerate(info):
+            semOffs, kfCount = info[i][:2]
+            bs.seek(semOffs)
+            kfTimes, coeffs = [], []
+            
+            for j in range(kfCount):
+                kfTimes.append(bs.readFloat())
+                for k in range(4 if i == 1 else 3):                    
+                    coeffs.append([bs.readFloat() for _ in range(4)])
+            
+            if kfCount == 1:
+                x = sample(coeffs[0], 0)
+                y = sample(coeffs[1], 0)
+                z = sample(coeffs[2], 0)    
+                if i == 1:
+                    w = sample(coeffs[3], 0)
+                if i == 0:
+                    posNoeKeyFramedValues.append(NoeKeyFramedValue(0, NoeVec3([x, y, z])))
+                if i == 1:
+                    rotNoeKeyFramedValues.append(NoeKeyFramedValue(0, NoeQuat([x, y, z,w]).transpose()))
+                elif i == 2:
+                    scaleNoeKeyFramedValues.append(NoeKeyFramedValue(0, NoeVec3([x, y, z])))
+            else:
+                kfTimes.append(animLength)
+                mul = 4 if i == 1 else 3
+                for j in range(kfCount):
+                    t0,t1 = int(kfTimes[j]), int(kfTimes[j+1])
+                    for k in range(t1-t0):
+                        x = sample(coeffs[mul * j], k)
+                        y = sample(coeffs[mul * j+1], k)
+                        z = sample(coeffs[mul * j+2], k)    
+                        if i == 1:
+                            w = sample(coeffs[mul * j+3], k)
+                        t = (t0 + k) * fpsInv
+                        if i == 0:
+                            posNoeKeyFramedValues.append(NoeKeyFramedValue(t, NoeVec3([x, y, z])))
+                        if i == 1:
+                            rotNoeKeyFramedValues.append(NoeKeyFramedValue(t, NoeQuat([x, y, z,w]).transpose()))
+                        elif i == 2:
+                            scaleNoeKeyFramedValues.append(NoeKeyFramedValue(t, NoeVec3([x, y, z])))
+            
+        if bIsAdditive:
+            actionBone.flags |= noesis.KFBONEFLAG_ADDITIVE
+        actionBone.setRotation(rotNoeKeyFramedValues, noesis.NOEKF_ROTATION_QUATERNION_4,noesis.NOEKF_INTERPOLATE_LINEAR)
+        actionBone.setTranslation(posNoeKeyFramedValues, noesis.NOEKF_TRANSLATION_VECTOR_3,noesis.NOEKF_INTERPOLATE_LINEAR)
+        actionBone.setScale(scaleNoeKeyFramedValues, noesis.NOEKF_SCALE_VECTOR_3,noesis.NOEKF_INTERPOLATE_LINEAR)
+        
+        keyFramedBoneList.append(actionBone)       
+    anim = NoeKeyFramedAnim(animName, jointList, keyFramedBoneList, 30)
+
+    return anim
+
+def processV3Anim(bs, jointList, animName):
+    keyFramedBoneList = []
     bs.seek(0x53)
     bIsAdditive = bs.readByte()
     bs.seek(0x5C)
@@ -265,12 +352,32 @@ def processAnims(bs, jointList, animName):
     anim = NoeKeyFramedAnim(animName, jointList, keyFramedBoneList, 30)
 
     return anim
+    
+def processAnims(bs, jointList, animName):
+    bs.seek(0x50)
+    opcode = bs.readUByte()
+    if opcode == 1:
+        return processV1Anim(bs, jointList, animName)
+    elif opcode == 3:
+       return processV3Anim(bs, jointList, animName)
+    
+    
+    
 
 def LoadAnms(jointList, animationList, motPaths):  
     for path in motPaths:
         motData = rapi.loadIntoByteArray(path)
         if path.endswith(".mot"):
             bs2 = NoeBitStream(motData)
+            bDEHack = False
+            if bs2.readUInt() == 0x31636278: #compressed mot, see DE
+                bs2.seek(8)
+                decompSize = bs2.readUInt()
+                compSize = bs2.readUInt()
+                bs2.readBytes(0x20)
+                motData = rapi.decompInflate(bs2.readBytes(compSize),decompSize)
+                bs2 = NoeBitStream(motData)
+                bDEHack = True
             bs2.seek(0xC)
             n = bs2.readUInt()
             offs = bs2.readUInt()
@@ -284,14 +391,14 @@ def LoadAnms(jointList, animationList, motPaths):
                 names.append(bs2.readString())
                 bs2.seek(next)
             for offs, size, name in zip(offsets, sizes, names):
-                if name.endswith(".anm"):
+                if name.endswith(".anm") or bDEHack:
                     an = processAnims(NoeBitStream(motData[offs:offs+size]), jointList, name)
                     if an is not None:
                         animationList.append(an)
         else:
             bs2 = NoeBitStream(motData)
             lName = rapi.getLocalFileName(path)
-            an = processAnims(bs2, jointList, lName)[0]
+            an = processAnims(bs2, jointList, lName)
             if an is not None:
                 animationList.append(an)      
                 
@@ -352,18 +459,33 @@ def findChrName(inputName):
     for root, dirs, files in os.walk(rapi.getDirForFilePath(inputName)):
         for fileName in files:
             filesL.append([root, fileName])
-    while len(chrName)>4:
-        for f in filesL:
-            if f[1].startswith(chrName) and f[1].endswith(".chr") and os.stat(os.path.join(f[0], f[1])).st_size > 5000:
+    originalName = chrName + ".wimdo"
+    while len(chrName)>=4:
+        for f in filesL:                
+            if f[1].startswith(chrName) and (f[1].endswith(".chr") or f[1].endswith(".arc")) and os.stat(os.path.join(f[0], f[1])).st_size > 3000 and f[1] <= originalName:
                 print("Loaded chr : " + f[1])
                 return os.path.join(f[0], f[1])    
         chrName = chrName[:-1]
 
 def LoadModel(data, mdlList):
     
+    global bLoadSeveralWimdos
+    global bLoadAnims
+    
     ctx = rapi.rpgCreateContext()
     
     wimdoPaths = [rapi.getInputName()]
+    motPaths = []
+    
+    if noesis.optWasInvoked("-wimdoList"):
+        bLoadSeveralWimdos = False
+        for p in noesis.optGetArg("-wimdoList").split("||"):
+            wimdoPaths.append(p)    
+
+    if noesis.optWasInvoked("-wimdoAnm"):
+        bLoadAnims = False
+        for p in noesis.optGetArg("-wimdoAnm").split("||"):
+            motPaths.append(p)
     
     #should probably cache paths only and check for integrity later. Oh well
     if bLoadSeveralWimdos:
@@ -375,7 +497,7 @@ def LoadModel(data, mdlList):
             else:
                 wimdoLoop = False
                 
-    motPaths = []
+    
     if bLoadAnims:
         motLoop = True
         while motLoop:
@@ -411,7 +533,7 @@ def LoadModel(data, mdlList):
             assert 0
      
     for wimdoID, wimdoPath in enumerate(wimdoPaths):    
-        #Buffers (wismt)
+        # Buffers (wismt)
         print(wimdoPath)
         inputName = rapi.getExtensionlessName(wimdoPath)
         if not rapi.checkFileExists(inputName+".wismt"):
@@ -452,24 +574,24 @@ def LoadModel(data, mdlList):
         bs.read('6i')
         morphOffs, buffSize, buffOffs, _, skinBufferInfoOfs = bs.readUInt(), bs.readUInt(), bs.readUInt(), bs.readUInt(), bs.readUInt()
         
-        #vBuffs 
+        # vBuffs 
         bs.seek(vBuffOfs)
         vBufferInfo = [[bs.readUInt() for i in range(8)] for _ in range(vBuffCount)]
         for vBuff in vBufferInfo:
             bs.seek(vBuff[3])
             vBuff.append([[bs.readUShort(), bs.readUShort()] for _ in range(vBuff[4])])
-        #idxBuffs 
+        # idxBuffs 
         bs.seek(idxBuffOfs)
         idxBufferInfo = [[bs.readUInt() for i in range(5)] for _ in range(idxBuffCount)]  
         wPals = [] #investigate this stuff properly at some point, see Ghidra's bookmarks for the involved functions and skinflags.Use 
-        #skinBuffer
+        # skinBuffer
         if skinBufferInfoOfs:
             bs.seek(skinBufferInfoOfs)
             skinBufferInfo = [bs.readUInt(), bs.readUInt(), bs.readUShort(), bs.readUShort(), bs.readUInt(), bs.readUInt()]
             bs.seek(skinBufferInfo[1])
             for i in range(skinBufferInfo[0]):
                 wPals.append([bs.readUInt() for _ in range(7)] + [bs.readUByte() for _ in range(4)] + [bs.readUInt(), bs.readUInt()])
-        #morphs
+        # morphs
         buffIdxToMorphBuffer = {} 
 
         if morphOffs:
@@ -490,11 +612,11 @@ def LoadModel(data, mdlList):
                 defaultBuffer = bs.readBytes(defaultVCount*defaultStride)
                 buffIdxToMorphBuffer[vBufferIndex] = [defaultBuffer,defaultStride]  
         
-        #wimdo
+        # wimdo
         bs = NoeBitStream(data if not wimdoID else rapi.loadIntoByteArray(wimdoPath))
         bs.seek(0x8)
         modelOffs = bs.readUInt()
-        #Model info
+        # Model info
         bs.seek(modelOffs)
         bs.readUInt()
         bs.read('6f')
@@ -505,14 +627,14 @@ def LoadModel(data, mdlList):
         bs.read('21f')
         morphOffs = bs.readUInt()
         
-        #Mesh
+        # Mesh
         primList = []
         for m in range(meshCount):        
             bs.seek(modelOffs + meshOffs + 0x44*m)
             primOffs = bs.readUInt()
             primCount = bs.readUInt()
             bs.read('8f')
-            #Prim
+            # Prim
             bs.seek(modelOffs + primOffs)
             for p in range(primCount):            
                 renderFlags = bs.readUInt()
@@ -525,7 +647,7 @@ def LoadModel(data, mdlList):
                 bs.read('4i')
                 primList.append([vBufferID, idxBufferID, lod, renderFlags, skinFlags])
         
-        #skinInfo
+        # skinInfo
         doJointList = []
         localIDToName = {}
         
@@ -534,7 +656,7 @@ def LoadModel(data, mdlList):
         doNameOffs = bs.readUInt()
         doJointMatOffs = bs.readUInt()
         bs.read('3i')
-        doJointIndicesOffs = bs.readUInt()
+        doNonASJointIndicesOffs = bs.readUInt() #Not sure
         ASSectionOffs1 = bs.readUInt()
         bs.readUInt()
         ASSectionOffs = bs.readUInt()
@@ -551,26 +673,27 @@ def LoadModel(data, mdlList):
         for i in range(doJointCount):
             doJointMats.append(NoeMat44.fromBytes(bs.readBytes(0x40)).toMat43().inverse())
         
-        if ASSectionOffs1:
-            bs.seek(skinOffs + ASSectionOffs1)
-            ASDataOffs, ASDataCount = bs.readUInt(), bs.readUInt()
-            bs.seek(skinOffs + ASDataOffs)
-            for i in range(ASDataCount):
-                bs.readUInt()
-                jID, pID = bs.readShort(), bs.readShort()
-                doJointList.append(NoeBone(jID,doJointNames[jID],doJointMats[jID],doJointNames[pID],-1))
-                bs.readBytes(0x1C)
-            doJointList.sort(key=lambda x: x.index)
-        
-        if ASSectionOffs:
-            bs.seek(skinOffs + ASSectionOffs)
-            ASDataOffs, ASDataCount = bs.readUInt(), bs.readUInt()
-            bs.seek(skinOffs + ASDataOffs)
-            for i in range(ASDataCount):
-                jID, pID = bs.readShort(), bs.readShort()
-                doJointList.append(NoeBone(jID,doJointNames[jID],doJointMats[jID],doJointNames[pID],-1))
-                bs.readBytes(0x4C)        
-            doJointList.sort(key=lambda x: x.index)
+        if doNonASJointIndicesOffs: #Hack?
+            if ASSectionOffs1:
+                bs.seek(skinOffs + ASSectionOffs1)
+                ASDataOffs, ASDataCount = bs.readUInt(), bs.readUInt()
+                bs.seek(skinOffs + ASDataOffs)
+                for i in range(ASDataCount):
+                    bs.readUInt()
+                    jID, pID = bs.readShort(), bs.readShort()
+                    doJointList.append(NoeBone(jID,doJointNames[jID],doJointMats[jID],doJointNames[pID],-1))
+                    bs.readBytes(0x1C)
+                doJointList.sort(key=lambda x: x.index)
+            
+            if ASSectionOffs:
+                bs.seek(skinOffs + ASSectionOffs)
+                ASDataOffs, ASDataCount = bs.readUInt(), bs.readUInt()
+                bs.seek(skinOffs + ASDataOffs)
+                for i in range(ASDataCount):
+                    jID, pID = bs.readShort(), bs.readShort()
+                    doJointList.append(NoeBone(jID,doJointNames[jID],doJointMats[jID],doJointNames[pID],-1))
+                    bs.readBytes(0x4C)        
+                doJointList.sort(key=lambda x: x.index)
         for doJ in doJointList:
             doJ.index = len(jointList)
             if doJ.name not in nameToFinalID:
@@ -602,9 +725,8 @@ def LoadModel(data, mdlList):
             bs.seek(buffOffs + ofs)
             vBuf = bs.readBytes(size * stride)
             semOfs = 0
-            # t = []
             for desc in vBufferInfo[vBufID][-1]:
-                #position
+                # position
                 if vBufID in buffIdxToMorphBuffer:
                     mBuf, mStride = buffIdxToMorphBuffer[vBufID]
                     rapi.rpgBindPositionBufferOfs(mBuf, noesis.RPGEODATA_FLOAT,  mStride, 0)
@@ -613,20 +735,20 @@ def LoadModel(data, mdlList):
                 if desc[0] == 0:
                     bRender = True                
                     rapi.rpgBindPositionBufferOfs(vBuf, noesis.RPGEODATA_FLOAT, stride, semOfs)
-                #normals
+                # normals
                 elif desc[0] == 28:
                     rapi.rpgBindNormalBufferOfs(vBuf, noesis.RPGEODATA_BYTE, stride, semOfs)
-                #UV1
+                # UV1
                 elif desc[0] == 5:
                     rapi.rpgBindUV1BufferOfs(vBuf, noesis.RPGEODATA_FLOAT, stride, semOfs)
-                #UV2
+                # UV2
                 elif desc[0] == 6:
                     rapi.rpgBindUV2BufferOfs(vBuf, noesis.RPGEODATA_FLOAT, stride, semOfs)
-                #UV3
+                # UV3
                 elif desc[0] == 7:
                     rapi.rpgBindUVXBufferOfs(vBuf, noesis.RPGEODATA_FLOAT, stride, 2,2,semOfs)
                 
-                #Do skinning eventually properly, good enough for most XC3 for now.
+                # Do skinning eventually properly, good enough for most XC3 for now.
                 elif desc[0] == 3: 
                     bs2 = NoeBitStream(vBuf)
                     bs2.seek(semOfs)
@@ -650,13 +772,12 @@ def LoadModel(data, mdlList):
             rapi.rpgClearBufferBinds()
             
     animationList = []
-    if jointList and bLoadAnims:
+    if jointList and motPaths:
         LoadAnms(jointList, animationList, motPaths)    
     try:
         mdl = rapi.rpgConstructModel()
     except:
         mdl = NoeModel()
-    
     if jointList:        
         mdl.setBones(jointList)
         if animationList:
