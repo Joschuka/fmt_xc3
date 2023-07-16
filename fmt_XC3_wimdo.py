@@ -402,70 +402,80 @@ def LoadAnms(jointList, animationList, motPaths):
             if an is not None:
                 animationList.append(an)      
                 
-def LoadSkel(bs):
+def LoadSkel(bs, offs):
     jointList = []
-    bs.seek(0xC)
-    entryCount, entryOffs = bs.readUInt(), bs.readUInt()
-    bs.seek(entryOffs)
-    offsets, sizes, names = [], [], []
-    for i in range(entryCount):
-        next = bs.tell() + 0x40
-        offsets.append(bs.readUInt())
-        sizes.append(bs.readUInt())
+    
+    bs.seek(offs + bs.readUInt() + 0x20)
+    arrays = [[bs.readUInt64(), bs.readUInt(), bs.readUInt()] for j in range(8)]
+    
+    #parenting
+    pList = []
+    bs.seek(arrays[0][0] + offs)
+    for i in range(arrays[0][1]):
+        pList.append(bs.readShort())
+    
+    #names
+    jNames = []
+    for i in range(arrays[1][1]):
+        bs.seek(arrays[1][0] + offs + i*0x10)        
+        bs.seek(bs.readUInt64() + offs)
+        jNames.append(bs.readString())
+        
+    #mats
+    jMats = []
+    bs.seek(arrays[2][0] + offs)
+    for i in range(arrays[2][1]):
+        pos = NoeVec3.fromBytes(bs.readBytes(0xC))
         bs.readUInt()
-        names.append(bs.readString())
-        bs.seek(next)
-    for offs in offsets:
-        bs.seek(offs + 0x20)
-        if bs.readUInt64() != 5495881740129927174: #6 SKEL
-            continue
-        bs.seek(offs + bs.readUInt() + 0x20)
-        arrays = [[bs.readUInt64(), bs.readUInt(), bs.readUInt()] for j in range(8)]
+        quat = NoeQuat.fromBytes(bs.readBytes(0x10)).transpose()
+        bs.read('4f')
+        mat = quat.toMat43()
+        mat[3] = pos
+        jMats.append(mat)
         
-        #parenting
-        pList = []
-        bs.seek(arrays[0][0] + offs)
-        for i in range(arrays[0][1]):
-            pList.append(bs.readShort())
-        
-        #names
-        jNames = []
-        for i in range(arrays[1][1]):
-            bs.seek(arrays[1][0] + offs + i*0x10)        
-            bs.seek(bs.readUInt64() + offs)
-            jNames.append(bs.readString())
-            
-        #mats
-        jMats = []
-        bs.seek(arrays[2][0] + offs)
-        for i in range(arrays[2][1]):
-            pos = NoeVec3.fromBytes(bs.readBytes(0xC))
-            bs.readUInt()
-            quat = NoeQuat.fromBytes(bs.readBytes(0x10)).transpose()
-            bs.read('4f')
-            mat = quat.toMat43()
-            mat[3] = pos
-            jMats.append(mat)
-            
-        for i, (p, n, m) in enumerate(zip(pList, jNames, jMats)):
-            jointList.append(NoeBone(i,n,m,None,p))
-        jointList = rapi.multiplyBones(jointList)
+    for i, (p, n, m) in enumerate(zip(pList, jNames, jMats)):
+        jointList.append(NoeBone(i,n,m,None,p))
+    jointList = rapi.multiplyBones(jointList)
     
     return jointList
 
-def findChrName(inputName):
+def findAndLoadChr(inputName, seenChr):
     chrName = rapi.getLocalFileName(inputName)
     filesL = []
     for root, dirs, files in os.walk(rapi.getDirForFilePath(inputName)):
         for fileName in files:
             filesL.append([root, fileName])
     originalName = chrName + ".wimdo"
+    discardedCandidates = {}
     while len(chrName)>=4:
         for f in filesL:                
-            if f[1].startswith(chrName) and (f[1].endswith(".chr") or f[1].endswith(".arc")) and os.stat(os.path.join(f[0], f[1])).st_size > 3000 and f[1] <= originalName:
-                print("Loaded chr : " + f[1])
-                return os.path.join(f[0], f[1])    
+            if f[1].startswith(chrName) and (f[1].endswith(".chr") or f[1].endswith(".arc")) and f[1] <= originalName and f[1] not in discardedCandidates:
+                #did we already load that one for a previous wimdo
+                if f[1] in seenChr:
+                    return []
+                # check if the candidate does actually have a skel:
+                bs = NoeBitStream((rapi.loadIntoByteArray(os.path.join(f[0], f[1]))))
+                bs.seek(0xC)
+                entryCount, entryOffs = bs.readUInt(), bs.readUInt()
+                bs.seek(entryOffs)
+                offsets, sizes, names = [], [], []
+                for i in range(entryCount):
+                    next = bs.tell() + 0x40
+                    offsets.append(bs.readUInt())
+                    sizes.append(bs.readUInt())
+                    bs.readUInt()
+                    names.append(bs.readString())
+                    bs.seek(next)
+                for offs in offsets:
+                    bs.seek(offs + 0x20)
+                    if bs.readUInt64() == 5495881740129927174: #6 SKEL
+                        seenChr[f[1]] = True
+                        print("Loaded: " + f[1])
+                        return LoadSkel(bs, offs)
+                discardedCandidates[f[1]] = True
+                   
         chrName = chrName[:-1]
+    return None
 
 def LoadModel(data, mdlList):
     
@@ -478,11 +488,13 @@ def LoadModel(data, mdlList):
     motPaths = []
     
     if noesis.optWasInvoked("-wimdoList"):
-        bLoadSeveralWimdos = False
+        bLoadSeveralWimdos = False            
         for p in noesis.optGetArg("-wimdoList").split("||"):
-            wimdoPaths.append(p)    
+            if p.endswith(".wimdo"):
+                wimdoPaths.append(p)    
 
     if noesis.optWasInvoked("-wimdoAnm"):
+        global bLoadAnims
         bLoadAnims = False
         for p in noesis.optGetArg("-wimdoAnm").split("||"):
             motPaths.append(p)
@@ -515,10 +527,9 @@ def LoadModel(data, mdlList):
     #Skel (chr)
     for wimdoID, wimdoPath in enumerate(wimdoPaths):
         inputName = rapi.getExtensionlessName(wimdoPath)
-        chrName = findChrName(inputName)
-        if rapi.checkFileExists(chrName) and chrName not in seenChr:
-            jList = list(LoadSkel(NoeBitStream((rapi.loadIntoByteArray(chrName)))))
-            seenChr[chrName] = True
+        jList = findAndLoadChr(inputName, seenChr)
+        if jList is not None and jList:
+            jList = list(jList)
             for joint in jList:
                 if joint.name not in nameToFinalID:
                     joint.parentName = jList[joint.parentIndex].name if joint.parentIndex >= 0 else ""
@@ -529,7 +540,7 @@ def LoadModel(data, mdlList):
                         joint.name = "FC_toothbase"
                     nameToFinalID[joint.name] = len(jointList)
                     jointList.append(NoeBone(len(jointList), joint.name, joint.getMatrix(), joint.parentName))
-        elif chrName not in seenChr:
+        elif jList is None:
             assert 0
      
     for wimdoID, wimdoPath in enumerate(wimdoPaths):    
