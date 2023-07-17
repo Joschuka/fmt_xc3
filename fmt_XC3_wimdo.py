@@ -185,6 +185,14 @@ def processV1Anim(bs, jointList, animName):
 
 def processV3Anim(bs, jointList, animName):
     keyFramedBoneList = []
+    
+    #These entries hold interesting info, more research needed. For now, try retrieving rootMotion tracks when relevant from these
+    bs.seek(0xC)
+    chunk2EntryCount = bs.readUInt()
+    bs.readUInt64()
+    bs.seek(bs.readUInt64())
+    chunk2Entries = [bs.readUInt64() for _ in range(chunk2EntryCount)]    
+    
     bs.seek(0x53)
     bIsAdditive = bs.readByte()
     bs.seek(0x5C)
@@ -220,7 +228,8 @@ def processV3Anim(bs, jointList, animName):
     #root motion (mostly for cutscene anims, check D&J for obvious ex. Need more testing to see if game anims have root motion somewhere too, didn't test these much)
     bs.seek(animDataOffs + 0x50)
     rootMInfoOffs = bs.readUInt()
-    if rootMInfoOffs:
+    bHasRootM = rootMInfoOffs > 0
+    if bHasRootM:
         bs.seek(rootMInfoOffs)
         rootMArrays = [[bs.readUInt64(), bs.readUInt(), bs.readUInt()] for j in range(6)]
         posNoeKeyFramedValues = []
@@ -271,6 +280,18 @@ def processV3Anim(bs, jointList, animName):
         actionBone.setTranslation(posNoeKeyFramedValues, noesis.NOEKF_TRANSLATION_VECTOR_3,noesis.NOEKF_INTERPOLATE_LINEAR)
         actionBone.setScale(scaleNoeKeyFramedValues, noesis.NOEKF_SCALE_VECTOR_3,noesis.NOEKF_INTERPOLATE_LINEAR)
         keyFramedBoneList.append(actionBone)
+    else:#No "easy" rootM trakcs, try retrieving it from chunk2 entries, if it exists
+        for e in chunk2Entries:
+            bs.seek(e)
+            candidateOffs = bs.readUInt64()
+            if bs.readUInt() == animLength and bs.readUInt64() == 0xFFFFFFFFFFFFFFFF and bs.readUInt() == 0xFFFFFFFF: #figure out how it truly works eventually. Rot tracks too somewhere?
+                bs.seek(candidateOffs)
+                rootPosVals = [bs.read('<4f')[:-1] for i in range(animLength)]
+                posNoeKeyFramedValues = [NoeKeyFramedValue(k* fpsInv, rootPosVals[k]) for k in range(animLength)]
+                actionBone = NoeKeyFramedBone(0)
+                actionBone.setTranslation(posNoeKeyFramedValues, noesis.NOEKF_TRANSLATION_VECTOR_3,noesis.NOEKF_INTERPOLATE_LINEAR)
+                keyFramedBoneList.append(actionBone)
+                bHasRootM = True
     
     #joint indices
     bs.seek(jIDOffs)
@@ -291,7 +312,7 @@ def processV3Anim(bs, jointList, animName):
         remap[jID] = hashMap[hash][1]
     
     for jID, info in zip(jIDs, infos):
-        if jID == 0 and rootMInfoOffs:
+        if jID == 0 and bHasRootM:
             continue 
         if jID not in remap:
             continue #same as above
