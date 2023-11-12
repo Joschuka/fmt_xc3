@@ -12,6 +12,8 @@ def registerNoesisTypes():
     noesis.setHandlerLoadModel(handle, LoadModel)
     noesis.addOption(handle, "-wimdoList", "Wimdo list", noesis.OPTFLAG_WANTARG)
     noesis.addOption(handle, "-wimdoAnm", "Wimdo anim", noesis.OPTFLAG_WANTARG)
+    noesis.addOption(handle, "-wimdoSkelOnly", "Wimdo skel only", 0)
+    noesis.addOption(handle, "-wimdoNoAnm", "Wimdo model only", 0)
     return 1
 
 def CheckType(data):
@@ -93,8 +95,10 @@ def sample(coeffs, t):
     a,b,c,d = coeffs
     return a * (t*t*t) + b *(t*t) + c*t + d
 
-def processV1Anim(bs, jointList, animName):
+def processV1Anim(bs, jointList, animName, nameToFinalID):
     keyFramedBoneList = []
+    bs.seek(0x51)
+    bIsModelSpace = bs.readByte()
     bs.seek(0x53)
     bIsAdditive = bs.readByte()
     bs.seek(0x5C)
@@ -113,21 +117,35 @@ def processV1Anim(bs, jointList, animName):
     
     #jInfo
     bs.seek(animDataOffs + 0x20)    
-    jIDOffs = bs.readUInt64()
-    jCount = bs.readUInt()
+    jIDOffs, jCount, pad = bs.readUInt64(), bs.readUInt(), bs.readInt()
+    jNameOffs, jNameCount, pad = bs.readUInt64(), bs.readUInt(), bs.readInt()
+    weirdOffs, weirdCount, pad = bs.readUInt64(), bs.readUInt(), bs.readInt()
     # assert jCount == entryCount see pc000101.mot
+    
+    if pad == -1:
+        assert(0) #more extra stuff, not expected in type 1
     
     #joint indices
     bs.seek(jIDOffs)
     jIDToInfo = []
     for i in range(jCount):
         jIDToInfo.append(bs.readShort())
-    
+        
+    #joint name for remap
+    animJNames = []
+    for i in range(jNameCount):
+        bs.seek(jNameOffs + i*8)
+        bs.seek(bs.readUInt())
+        animJNames.append(bs.readString())
+
     for jID, infoID in enumerate(jIDToInfo):
         if infoID == -1:
             continue
         info = infos[infoID]
-        actionBone = NoeKeyFramedBone(jID)
+        if animJNames and animJNames[jID] in nameToFinalID:
+            actionBone = NoeKeyFramedBone(nameToFinalID[animJNames[jID]])
+        else:
+            actionBone = NoeKeyFramedBone(jID)
         posNoeKeyFramedValues = []
         rotNoeKeyFramedValues = []		
         scaleNoeKeyFramedValues = []
@@ -174,6 +192,79 @@ def processV1Anim(bs, jointList, animName):
             
         if bIsAdditive:
             actionBone.flags |= noesis.KFBONEFLAG_ADDITIVE
+        if bIsModelSpace:
+            actionBone.flags |= noesis.KFBONEFLAG_MODELSPACE
+        actionBone.setRotation(rotNoeKeyFramedValues, noesis.NOEKF_ROTATION_QUATERNION_4,noesis.NOEKF_INTERPOLATE_LINEAR)
+        actionBone.setTranslation(posNoeKeyFramedValues, noesis.NOEKF_TRANSLATION_VECTOR_3,noesis.NOEKF_INTERPOLATE_LINEAR)
+        actionBone.setScale(scaleNoeKeyFramedValues, noesis.NOEKF_SCALE_VECTOR_3,noesis.NOEKF_INTERPOLATE_LINEAR)
+        
+        keyFramedBoneList.append(actionBone)       
+    anim = NoeKeyFramedAnim(animName, jointList, keyFramedBoneList, 30)
+
+    return anim
+    
+def processV0Anim(bs, jointList, animName, nameToFinalID):
+    keyFramedBoneList = []
+    bs.seek(0x51)
+    bIsModelSpace = bs.readByte()
+    bs.seek(0x53)
+    bIsAdditive = bs.readByte()
+    bs.seek(0x5C)
+    animLength = bs.readUInt()
+    bs.seek(0x78)
+    offs, entryCount, _ = bs.readUInt64(), bs.readUInt(), bs.readUInt()
+    fpsInv = 0.03333334  
+    
+    bs.seek(0x28)
+    animDataOffs = bs.readUInt()
+    
+    #jInfo
+    bs.seek(animDataOffs + 0x20)    
+    jIDOffs, jCount, pad = bs.readUInt64(), bs.readUInt(), bs.readInt()
+    jNameOffs, jNameCount, pad = bs.readUInt64(), bs.readUInt(), bs.readInt()
+    weirdOffs, weirdCount, pad = bs.readUInt64(), bs.readUInt(), bs.readInt()
+    
+    if pad == -1:
+        assert(0) #more extra stuff, not expected in type 0
+    
+    #joint indices
+    bs.seek(jIDOffs)
+    jIDs = []
+    for i in range(jCount):
+        jIDs.append(bs.readShort())
+        
+    #joint name for remap
+    animJNames = []
+    for i in range(jNameCount):
+        bs.seek(jNameOffs + i*8)
+        bs.seek(bs.readUInt())
+        animJNames.append(bs.readString())
+    
+    for k, jID in enumerate(jIDs):
+        if jID == -1:
+            continue
+        if animJNames and animJNames[jID] in nameToFinalID:
+            actionBone = NoeKeyFramedBone(nameToFinalID[animJNames[jID]])
+        else:
+            actionBone = NoeKeyFramedBone(jID)
+        posNoeKeyFramedValues = []
+        rotNoeKeyFramedValues = []		
+        scaleNoeKeyFramedValues = []
+        for i in range(animLength):
+            bs.seek(offs + i*jCount*48 + k*48)
+            pos = [bs.readFloat() for _ in range(3)]
+            bs.readFloat()
+            rot = [bs.readFloat() for _ in range(4)]
+            scale = [bs.readFloat() for _ in range(3)]
+            bs.readFloat()
+            posNoeKeyFramedValues.append(NoeKeyFramedValue(i*fpsInv, NoeVec3(pos)))
+            rotNoeKeyFramedValues.append(NoeKeyFramedValue(i*fpsInv, NoeQuat(rot).transpose()))
+            scaleNoeKeyFramedValues.append(NoeKeyFramedValue(i*fpsInv, NoeVec3(scale)))
+            
+        if bIsAdditive:
+            actionBone.flags |= noesis.KFBONEFLAG_ADDITIVE
+        if bIsModelSpace:
+            actionBone.flags |= noesis.KFBONEFLAG_MODELSPACE
         actionBone.setRotation(rotNoeKeyFramedValues, noesis.NOEKF_ROTATION_QUATERNION_4,noesis.NOEKF_INTERPOLATE_LINEAR)
         actionBone.setTranslation(posNoeKeyFramedValues, noesis.NOEKF_TRANSLATION_VECTOR_3,noesis.NOEKF_INTERPOLATE_LINEAR)
         actionBone.setScale(scaleNoeKeyFramedValues, noesis.NOEKF_SCALE_VECTOR_3,noesis.NOEKF_INTERPOLATE_LINEAR)
@@ -183,7 +274,7 @@ def processV1Anim(bs, jointList, animName):
 
     return anim
 
-def processV3Anim(bs, jointList, animName):
+def processV3Anim(bs, jointList, animName, nameToFinalID):
     keyFramedBoneList = []
     
     #These entries hold interesting info, more research needed. For now, try retrieving rootMotion tracks when relevant from these
@@ -193,6 +284,8 @@ def processV3Anim(bs, jointList, animName):
     bs.seek(bs.readUInt64())
     chunk2Entries = [bs.readUInt64() for _ in range(chunk2EntryCount)]    
     
+    bs.seek(0x51)
+    bIsModelSpace = bs.readByte()
     bs.seek(0x53)
     bIsAdditive = bs.readByte()
     bs.seek(0x5C)
@@ -276,6 +369,8 @@ def processV3Anim(bs, jointList, animName):
             
         if bIsAdditive:
             actionBone.flags |= noesis.KFBONEFLAG_ADDITIVE
+        if bIsModelSpace:
+            actionBone.flags |= noesis.KFBONEFLAG_MODELSPACE
         actionBone.setRotation(rotNoeKeyFramedValues, noesis.NOEKF_ROTATION_QUATERNION_4,noesis.NOEKF_INTERPOLATE_LINEAR)
         actionBone.setTranslation(posNoeKeyFramedValues, noesis.NOEKF_TRANSLATION_VECTOR_3,noesis.NOEKF_INTERPOLATE_LINEAR)
         actionBone.setScale(scaleNoeKeyFramedValues, noesis.NOEKF_SCALE_VECTOR_3,noesis.NOEKF_INTERPOLATE_LINEAR)
@@ -374,18 +469,20 @@ def processV3Anim(bs, jointList, animName):
 
     return anim
     
-def processAnims(bs, jointList, animName):
+def processAnims(bs, jointList, animName, nameToFinalID):
     bs.seek(0x50)
     opcode = bs.readUByte()
     if opcode == 1:
-        return processV1Anim(bs, jointList, animName)
+        return processV1Anim(bs, jointList, animName, nameToFinalID)
     elif opcode == 3:
-       return processV3Anim(bs, jointList, animName)
+       return processV3Anim(bs, jointList, animName, nameToFinalID)
+    elif opcode == 0:
+        return processV0Anim(bs, jointList, animName, nameToFinalID)
     
     
     
 
-def LoadAnms(jointList, animationList, motPaths):  
+def LoadAnms(jointList, animationList, motPaths, nameToFinalID):  
     for path in motPaths:
         motData = rapi.loadIntoByteArray(path)
         if path.endswith(".mot"):
@@ -413,13 +510,13 @@ def LoadAnms(jointList, animationList, motPaths):
                 bs2.seek(next)
             for offs, size, name in zip(offsets, sizes, names):
                 if name.endswith(".anm") or bDEHack:
-                    an = processAnims(NoeBitStream(motData[offs:offs+size]), jointList, name)
+                    an = processAnims(NoeBitStream(motData[offs:offs+size]), jointList, name, nameToFinalID)
                     if an is not None:
                         animationList.append(an)
         else:
             bs2 = NoeBitStream(motData)
             lName = rapi.getLocalFileName(path)
-            an = processAnims(bs2, jointList, lName)
+            an = processAnims(bs2, jointList, lName, nameToFinalID)
             if an is not None:
                 animationList.append(an)      
                 
@@ -510,15 +607,17 @@ def LoadModel(data, mdlList):
     
     if noesis.optWasInvoked("-wimdoList"):
         bLoadSeveralWimdos = False            
-        for p in noesis.optGetArg("-wimdoList").split("||"):
+        for p in noesis.optGetArg("-wimdoList").split(","):
             if p.endswith(".wimdo"):
-                wimdoPaths.append(p)    
+                wimdoPaths.append(os.path.dirname(rapi.getInputName()) + os.sep + p)    
 
     if noesis.optWasInvoked("-wimdoAnm"):
-        global bLoadAnims
         bLoadAnims = False
         for p in noesis.optGetArg("-wimdoAnm").split("||"):
             motPaths.append(p)
+    
+    if noesis.optWasInvoked("-wimdoNoAnm"):
+        bLoadAnims = False
     
     #should probably cache paths only and check for integrity later. Oh well
     if bLoadSeveralWimdos:
@@ -564,7 +663,9 @@ def LoadModel(data, mdlList):
         elif jList is None:
             assert 0
      
-    for wimdoID, wimdoPath in enumerate(wimdoPaths):    
+    for wimdoID, wimdoPath in enumerate(wimdoPaths): 
+        if noesis.optWasInvoked("-wimdoSkelOnly"):
+            continue
         # Buffers (wismt)
         print(wimdoPath)
         inputName = rapi.getExtensionlessName(wimdoPath)
@@ -805,7 +906,7 @@ def LoadModel(data, mdlList):
             
     animationList = []
     if jointList and motPaths:
-        LoadAnms(jointList, animationList, motPaths)    
+        LoadAnms(jointList, animationList, motPaths, nameToFinalID)    
     try:
         mdl = rapi.rpgConstructModel()
     except:
